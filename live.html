@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#121110">
+<title>Beatbox Live test</title>
+<link rel="icon" href="data:,">
+<style>
+/* Proof of concept: beatbox in, drum out, as fast as the browser allows. Same look as Beatbox Translator. */
+:root{--bg:#121110;--case:#1d1c1a;--edge:#34312d;--ink:#efe8dc;--mute:#a39d92;--amber:#ffb547;--rec:#ff4a26;--kick:#ff5b2e;--snare:#ffa62b;--hat:#ffd84d;color-scheme:dark}
+*{box-sizing:border-box;min-width:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+main{max-width:640px;margin:0 auto;padding:18px 14px 40px}
+h1{margin:0 0 4px;font-size:26px;line-height:1.1}
+h1 span{color:var(--rec)}
+.sub{margin:0 0 16px;color:var(--mute)}
+button{font:inherit;color:inherit;border:0;cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+#go{width:100%;min-height:64px;border-radius:16px;background:var(--rec);color:#fff;font-size:20px;font-weight:700}
+#go.on{background:#3a3733}
+.pads{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:16px 0}
+.pad{background:var(--case);border:1px solid var(--edge);border-radius:16px;padding:12px;text-align:center}
+.light{height:96px;border-radius:12px;background:#2a2825;display:grid;place-items:center;font-size:30px;font-weight:800;color:#0008;transition:background .25s,box-shadow .25s}
+.pad.hit .light{transition:none;background:var(--c);box-shadow:0 0 30px var(--c)}
+.pad b{display:block;margin:8px 0 2px;color:var(--c)}
+.pad small{display:block;color:var(--mute);min-height:20px}
+.teach{margin-top:8px;width:100%;min-height:44px;border-radius:10px;background:#2e2c29}
+.teach.busy{background:var(--amber);color:#1a1206}
+.box{background:var(--case);border:1px solid var(--edge);border-radius:16px;padding:14px;margin-top:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.row label{flex:1 1 200px}
+input[type=range]{width:100%}
+.big{font-size:34px;font-weight:800;color:var(--amber);font-variant-numeric:tabular-nums}
+.k{min-height:44px;padding:0 16px;border-radius:10px;background:#2e2c29}
+p{margin:6px 0}
+.mute{color:var(--mute);font-size:14px}
+#msg{min-height:24px;color:var(--amber)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Beatbox <span>Live</span> test</h1>
+  <p class="sub">Beatbox and hear drums right away. Proof of concept: kick, snare, hi-hat. <b>Use headphones</b>, or the drums from the speaker will trigger themselves.</p>
+  <button id="go">Start</button>
+  <p id="msg"></p>
+  <div class="pads">
+    <div class="pad" style="--c:var(--kick)" data-c="kick"><div class="light">B</div><b>Kick</b><small>“b”, “boom”</small><button class="teach" data-t="kick">Teach</button></div>
+    <div class="pad" style="--c:var(--snare)" data-c="snare"><div class="light">K</div><b>Snare</b><small>“pf”, “k”</small><button class="teach" data-t="snare">Teach</button></div>
+    <div class="pad" style="--c:var(--hat)" data-c="hat"><div class="light">T</div><b>Hi-hat</b><small>“t”, “ts”</small><button class="teach" data-t="hat">Teach</button></div>
+  </div>
+  <div class="box">
+    <div class="row"><label>Sensitivity <input type="range" id="sens" min="1" max="10" value="5"></label></div>
+    <p class="mute">Teach: tap Teach, then make that sound 3 times. Teaching all three makes it much more accurate. It's saved on this phone.</p>
+    <button class="k" id="forget">Forget taught sounds</button>
+  </div>
+  <div class="box">
+    <p><b>Delay</b></p>
+    <div class="row"><span class="big" id="delay">–</span><button class="k" id="measure">Measure</button></div>
+    <p class="mute" id="delayNote">Measure plays 5 clicks through the speaker and times how long they take to come back into the mic. Take headphones off for this, and stay quiet. Recognising a sound adds about 9 ms on top.</p>
+    <p class="mute" id="reported"></p>
+  </div>
+</main>
+
+<script type="text/worklet" id="proc">
+// Runs on the audio thread: detect a hit, classify it from its first ~8 ms, play the drum in the same audio block.
+class Live extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    const sr = sampleRate, a = ms => Math.exp(-1 / (sr * ms / 1000));
+    this.aF = a(1.5); this.aS = a(40); this.ef = 0; this.es = 1e-9; this.fH = 0; this.sH = 1e-9;
+    this.lpA = 1 - Math.exp(-2 * Math.PI * 250 / sr); this.hpA = 1 - Math.exp(-2 * Math.PI * 3500 / sr);
+    this.l1 = 0; this.l2 = 0; this.h1 = 0; this.h2 = 0;
+    this.win = Math.round(0.008 * sr); this.refr = Math.round(0.07 * sr);
+    this.ratio = 5; this.gate = 2e-5; this.since = 1e9; this.cap = null; this.clock = 0;
+    this.samples = {}; this.cent = null; this.mode = 'play'; this.voices = []; this.meas = null;
+    this.port.onmessage = e => {
+      const d = e.data;
+      if (d.samples) this.samples = d.samples;
+      if ('cent' in d) this.cent = d.cent;
+      if (d.sens) { this.ratio = 11 - d.sens; this.gate = 4e-6 * Math.pow(2, 10 - d.sens); }
+      if (d.mode) this.mode = d.mode;
+      if (d.measure) { this.meas = { left: d.measure, state: 'quiet', wait: Math.round(0.5 * sampleRate), t0: 0, res: [] }; this.mode = 'measure'; }
+    };
+  }
+  classify(lo, hi) {
+    const f = [Math.log10(lo + 1e-6), Math.log10(hi + 1e-6)];
+    if (this.cent) {
+      let best = null, bd = 1e9;
+      for (const c in this.cent) { const p = this.cent[c], d = (p[0] - f[0]) ** 2 + (p[1] - f[1]) ** 2; if (d < bd) { bd = d; best = c; } }
+      if (best) return best;
+    }
+    if (lo > 0.3) return 'kick';
+    if (hi > 0.85) return 'hat';
+    return 'snare';
+  }
+  play(c, g, at) { const b = this.samples[c]; if (b) this.voices.push({ b, i: 0, g, at }); }
+  process(inputs, outputs) {
+    const inp = inputs[0] && inputs[0][0], out = outputs[0][0], n = out.length;
+    for (let i = 0; i < n; i++) {
+      const x = inp ? inp[i] : 0, p = x * x;
+      this.l1 += this.lpA * (x - this.l1); this.l2 += this.lpA * (this.l1 - this.l2);
+      this.h1 += this.hpA * (x - this.h1); this.h2 += this.hpA * (this.h1 - this.h2);
+      const lo = this.l2, hi = x - this.h2;
+      // a jump in loudness, or in the highs alone (a hat right after a booming kick)
+      const onset = (this.ef > this.ratio * this.es && this.ef > this.gate) || (this.fH > this.ratio * this.sH && this.fH > this.gate * 0.3);
+      this.ef = this.aF * this.ef + (1 - this.aF) * p; this.es = this.aS * this.es + (1 - this.aS) * p;
+      const ph = hi * hi; this.fH = this.aF * this.fH + (1 - this.aF) * ph; this.sH = this.aS * this.sH + (1 - this.aS) * ph;
+      this.since++; this.clock++;
+      const M = this.meas;
+      if (M) { // round trip: click out, wait for it to come back in
+        if (M.state === 'quiet' && --M.wait <= 0) { M.state = 'listen'; M.t0 = this.clock; M.wait = Math.round(0.6 * sampleRate); this.play('click', 0.9, i); this.since = 0; }
+        else if (M.state === 'listen') {
+          if (this.since > 40 && onset) { M.res.push((this.clock - M.t0) / sampleRate * 1000); M.state = 'quiet'; M.wait = Math.round(0.4 * sampleRate); if (--M.left <= 0) { this.port.postMessage({ measured: M.res }); this.meas = null; this.mode = 'play'; } }
+          else if (--M.wait <= 0) { M.state = 'quiet'; M.wait = Math.round(0.3 * sampleRate); if (--M.left <= 0) { this.port.postMessage({ measured: M.res }); this.meas = null; this.mode = 'play'; } }
+        }
+        continue;
+      }
+      if (this.mode === 'off') continue;
+      if (this.cap) {
+        const c = this.cap; c.lo += lo * lo; c.hi += hi * hi; c.tot += p; c.pk = Math.max(c.pk, Math.abs(x));
+        if (++c.n >= this.win) {
+          const L = c.lo / (c.tot + 1e-12), H = c.hi / (c.tot + 1e-12), cls = this.classify(L, H), g = Math.min(1.1, 0.45 + 2 * c.pk);
+          if (this.mode === 'play') this.play(cls, g, i);
+          this.port.postMessage({ hit: cls, lo: L, hi: H, g, t: this.clock / sampleRate });
+          this.cap = null;
+        }
+      } else if (this.since > this.refr && onset) { this.cap = { n: 0, lo: 0, hi: 0, tot: 0, pk: 0 }; this.since = 0; }
+    }
+    for (const v of this.voices) { // mix the drums, starting exactly where they were triggered
+      for (let i = v.at; i < n && v.i < v.b.length; i++) out[i] += v.b[v.i++] * v.g;
+      v.at = 0;
+    }
+    this.voices = this.voices.filter(v => v.i < v.b.length);
+    for (let ch = 1; ch < outputs[0].length; ch++) outputs[0][ch].set(out);
+    return true;
+  }
+}
+registerProcessor('live-beat', Live);
+</script>
+
+<script>
+{
+const $ = s => document.querySelector(s);
+const store = { get(k, d) { try { const v = localStorage.getItem('live.' + k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem('live.' + k, JSON.stringify(v)); } catch (e) { /* private mode */ } } };
+let ctx = null, node = null, stream = null, teaching = null;
+const taught = store.get('taught', {}); // {kick:[[lo,hi],...], ...}
+
+// three drum sounds, rendered once (808-style)
+async function render(sr) {
+  const make = async (dur, build) => { const oc = new OfflineAudioContext(1, Math.round(sr * dur), sr); build(oc); return (await oc.startRendering()).getChannelData(0); };
+  const noise = oc => { const b = oc.createBuffer(1, oc.length, sr), d = b.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; const s = oc.createBufferSource(); s.buffer = b; return s; };
+  const env = (oc, g, peak, dur) => { g.gain.setValueAtTime(peak, 0); g.gain.exponentialRampToValueAtTime(0.0001, dur); };
+  const kick = await make(0.5, oc => { const o = oc.createOscillator(), g = oc.createGain(); o.frequency.setValueAtTime(130, 0); o.frequency.exponentialRampToValueAtTime(45, 0.09); env(oc, g, 1, 0.48); o.connect(g).connect(oc.destination); o.start(); });
+  const snare = await make(0.22, oc => {
+    const n = noise(oc), f = oc.createBiquadFilter(), g = oc.createGain(); f.type = 'highpass'; f.frequency.value = 1500; env(oc, g, 0.6, 0.2); n.connect(f).connect(g).connect(oc.destination); n.start();
+    const o = oc.createOscillator(), g2 = oc.createGain(); o.type = 'triangle'; o.frequency.value = 185; env(oc, g2, 0.45, 0.1); o.connect(g2).connect(oc.destination); o.start();
+  });
+  const hat = await make(0.07, oc => { const n = noise(oc), f = oc.createBiquadFilter(), g = oc.createGain(); f.type = 'highpass'; f.frequency.value = 7500; env(oc, g, 0.5, 0.06); n.connect(f).connect(g).connect(oc.destination); n.start(); });
+  const click = await make(0.012, oc => { const o = oc.createOscillator(), g = oc.createGain(); o.frequency.value = 1000; env(oc, g, 0.9, 0.011); o.connect(g).connect(oc.destination); o.start(); });
+  return { kick, snare, hat, click };
+}
+function centroids() {
+  const c = {};
+  for (const k of ['kick', 'snare', 'hat']) {
+    const t = taught[k]; if (!t || !t.length) continue;
+    c[k] = [0, 1].map(j => t.reduce((s, p) => s + Math.log10(p[j] + 1e-6), 0) / t.length);
+  }
+  return Object.keys(c).length === 3 ? c : null; // nearest-sound only once all three are taught
+}
+function paintTeach() {
+  document.querySelectorAll('.teach').forEach(b => {
+    const k = b.dataset.t, n = (taught[k] || []).length;
+    b.classList.toggle('busy', teaching && teaching.k === k);
+    b.textContent = teaching && teaching.k === k ? `Again… ${teaching.got.length}/3` : n ? 'Taught ✓ (redo)' : 'Teach';
+  });
+}
+function flash(c) { const p = document.querySelector(`.pad[data-c="${c}"]`); if (!p) return; p.classList.add('hit'); clearTimeout(p._t); p._t = setTimeout(() => p.classList.remove('hit'), 90); }
+
+async function start() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  try { ctx = new AC({ latencyHint: 0 }); } catch (e) { ctx = new AC({ latencyHint: 'interactive' }); }
+  try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) { /* older Safari */ }
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, latency: 0 } });
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([$('#proc').textContent], { type: 'application/javascript' })));
+  node = new AudioWorkletNode(ctx, 'live-beat', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
+  node.port.postMessage({ samples: await render(ctx.sampleRate), cent: centroids(), sens: +$('#sens').value });
+  node.port.onmessage = e => {
+    const d = e.data;
+    if (d.hit) {
+      if (teaching) {
+        teaching.got.push([d.lo, d.hi]); flash(teaching.k);
+        if (teaching.got.length >= 3) { taught[teaching.k] = teaching.got; store.set('taught', taught); teaching = null; node.port.postMessage({ mode: 'play', cent: centroids() }); $('#msg').textContent = centroids() ? 'All three taught. Now beatbox!' : 'Taught. Teach the others too for best results.'; }
+        paintTeach();
+      } else flash(d.hit);
+    }
+    if (d.measured) {
+      // trust it only when at least 3 clicks came back with the same delay
+      const r = d.measured.slice().sort((a, b) => a - b);
+      let best = [];
+      for (const a of r) { const g = r.filter(b => b >= a && b - a <= 8); if (g.length > best.length) best = g; }
+      if (best.length < 3) { $('#delay').textContent = '–'; $('#msg').textContent = r.length ? 'The clicks came back unevenly (noise?). Try again in a quiet room, headphones off, volume up.' : 'Couldn’t hear the clicks come back. Take headphones off and turn the volume up.'; return; }
+      const med = best[best.length >> 1], r2 = best;
+      $('#delay').textContent = Math.round(med) + ' ms';
+      $('#msg').textContent = `Speaker → mic round trip ${Math.round(med)} ms (${r2.length} of 5 clicks agreed). With recognition: about ${Math.round(med + 9)} ms from your sound to the drum.`;
+    }
+  };
+  const src = ctx.createMediaStreamSource(stream);
+  src.connect(node); node.connect(ctx.destination);
+  await ctx.resume();
+  const lat = s => (s == null ? '?' : Math.round(s * 1000) + ' ms');
+  let inLat = null; try { inLat = stream.getAudioTracks()[0].getSettings().latency; } catch (e) { /* not reported */ }
+  $('#reported').textContent = `Browser reports: output ${lat((ctx.baseLatency || 0) + (ctx.outputLatency || 0))}, input ${lat(inLat)} (often wrong on phones, so measure).`;
+  $('#go').textContent = 'Stop'; $('#go').classList.add('on');
+  $('#msg').textContent = 'Listening. Beatbox!';
+}
+function stop() {
+  try { stream.getTracks().forEach(t => t.stop()); ctx.close(); } catch (e) { /* already closed */ }
+  ctx = node = stream = null; teaching = null; paintTeach();
+  $('#go').textContent = 'Start'; $('#go').classList.remove('on'); $('#msg').textContent = '';
+}
+$('#go').addEventListener('click', async () => {
+  if (ctx) return stop();
+  try { await start(); } catch (e) { stop(); $('#msg').textContent = e && e.name === 'NotAllowedError' ? 'Microphone blocked. Allow it for this site in your browser settings.' : 'Could not start: ' + (e && e.message || e); }
+});
+document.querySelectorAll('.teach').forEach(b => b.addEventListener('click', () => {
+  if (!node) { $('#msg').textContent = 'Tap Start first.'; return; }
+  teaching = { k: b.dataset.t, got: [] }; node.port.postMessage({ mode: 'teach' }); paintTeach();
+  $('#msg').textContent = 'Make the sound 3 times, with a short pause in between.';
+}));
+$('#forget').addEventListener('click', () => { for (const k in taught) delete taught[k]; store.set('taught', taught); if (node) node.port.postMessage({ cent: null }); paintTeach(); $('#msg').textContent = 'Forgotten. Using the built-in guess.'; });
+$('#sens').addEventListener('input', () => { if (node) node.port.postMessage({ sens: +$('#sens').value }); });
+$('#measure').addEventListener('click', () => {
+  if (!node) { $('#msg').textContent = 'Tap Start first.'; return; }
+  teaching = null; paintTeach(); node.port.postMessage({ measure: 5 }); $('#msg').textContent = 'Measuring… stay quiet.';
+});
+paintTeach();
+window.LIVE = { get ctx() { return ctx; }, get node() { return node; }, taught };
+}
+</script>
+</body>
+</html>
